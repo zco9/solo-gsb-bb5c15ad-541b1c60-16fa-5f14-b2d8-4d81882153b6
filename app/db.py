@@ -15,18 +15,19 @@ _conn: sqlite3.Connection | None = None
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
-    id                  TEXT PRIMARY KEY,
-    total_chunks        INTEGER NOT NULL,
-    file_digest         TEXT NOT NULL,
-    digest_algorithm    TEXT NOT NULL DEFAULT 'sha256',
-    status              TEXT NOT NULL DEFAULT 'active',   -- active | finalized
-    max_active_leases   INTEGER,                          -- 会话级并发租约上限；NULL 表示不限
-    base_retry_seconds  INTEGER NOT NULL DEFAULT 5,       -- 失败退避基数（第 1 次失败冷却秒数）
-    max_retry_seconds   INTEGER NOT NULL DEFAULT 300,     -- 失败退避冷却上限（秒）
-    revision            INTEGER NOT NULL DEFAULT 0,       -- 修订号：每次成功 reopen 回退递增 1
-    source_session_id   TEXT,                             -- fork 来源会话；NULL 表示原生会话
-    created_at          TEXT NOT NULL,
-    finalized_at        TEXT
+    id                     TEXT PRIMARY KEY,
+    total_chunks           INTEGER NOT NULL,
+    file_digest            TEXT NOT NULL,
+    digest_algorithm       TEXT NOT NULL DEFAULT 'sha256',
+    status                 TEXT NOT NULL DEFAULT 'active',   -- active | finalized
+    max_active_leases      INTEGER,                          -- 会话级并发租约上限；NULL 表示不限
+    base_retry_seconds     INTEGER NOT NULL DEFAULT 5,       -- 失败退避基数（第 1 次失败冷却秒数）
+    max_retry_seconds      INTEGER NOT NULL DEFAULT 300,     -- 失败退避冷却上限（秒）
+    revision               INTEGER NOT NULL DEFAULT 0,       -- 修订号：每次成功 reopen 回退递增 1
+    source_session_id      TEXT,                             -- fork 来源会话；NULL 表示原生会话
+    verification_required  INTEGER NOT NULL DEFAULT 0,       -- 分片验收队列：1=启用，完成先进入待验收
+    created_at             TEXT NOT NULL,
+    finalized_at           TEXT
 );
 
 -- 进度分支幂等记录：(源会话, request_id) 唯一，重放返回首次创建的新会话
@@ -51,7 +52,7 @@ CREATE TABLE IF NOT EXISTS dispatch_cursors (
 CREATE TABLE IF NOT EXISTS chunks (
     session_id        TEXT NOT NULL REFERENCES sessions(id),
     chunk_index       INTEGER NOT NULL,
-    status            TEXT NOT NULL DEFAULT 'pending',  -- pending | leased | completed
+    status            TEXT NOT NULL DEFAULT 'pending',  -- pending | leased | awaiting_verification | completed
     lease_token       TEXT,
     lease_expires_at  TEXT,
     chunk_digest      TEXT,
@@ -62,6 +63,37 @@ CREATE TABLE IF NOT EXISTS chunks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_chunks_session ON chunks(session_id);
+
+-- 分片验收队列租约：每个 awaiting_verification 分片至多一条当前验收令牌记录。
+-- 明文验收令牌只在领取响应中返回一次，库内仅保存其 SHA-256（兼作主键）；
+-- 过期令牌可被重新领取（同一行 UPSERT 为新令牌），未过期时并发请求不会重复发放。
+CREATE TABLE IF NOT EXISTS verification_leases (
+    token_hash    TEXT PRIMARY KEY,                       -- 验收令牌的 SHA-256（64 位小写十六进制）
+    session_id    TEXT NOT NULL,
+    chunk_index   INTEGER NOT NULL,
+    issued_at     TEXT NOT NULL,                          -- 本次（重）领取时间，完成时间仍取 chunks.completed_at
+    expires_at    TEXT NOT NULL,
+    UNIQUE (session_id, chunk_index),
+    FOREIGN KEY (session_id, chunk_index) REFERENCES chunks(session_id, chunk_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_verification_leases_pending
+    ON verification_leases(session_id, chunk_index);
+
+-- 验收决定幂等记录：一枚验收令牌只能作一次决定，成功的 approve/reject 各插入一行。
+-- 同一令牌同一决定重放时按本行原样返回；同一令牌携带冲突决定返回 409。
+-- decide 成功后对应 verification_leases 行被删除，故本表不再对其建外键。
+CREATE TABLE IF NOT EXISTS verification_decisions (
+    token_hash    TEXT PRIMARY KEY,                       -- 作决定时所持验收令牌的 SHA-256
+    session_id    TEXT NOT NULL,
+    chunk_index   INTEGER NOT NULL,
+    decision      TEXT NOT NULL,                          -- approve | reject
+    decided_at    TEXT NOT NULL,
+    FOREIGN KEY (session_id, chunk_index) REFERENCES chunks(session_id, chunk_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_verification_decisions_chunk
+    ON verification_decisions(session_id, chunk_index);
 
 -- 分片依赖图：chunk_index 领取租约前，depends_on 必须已完成
 CREATE TABLE IF NOT EXISTS chunk_dependencies (
@@ -194,6 +226,43 @@ CREATE TABLE delivery_ticket_redemptions (
     response_json TEXT NOT NULL,
     created_at    TEXT NOT NULL,
     PRIMARY KEY (token_hash, request_id)
+)
+        """,
+    ),
+    # 0010: 分片验收队列开关；旧库既有会话取 0（关闭），完成上报与提交行为完全不变
+    (
+        "column",
+        "sessions.verification_required",
+        "ALTER TABLE sessions ADD COLUMN verification_required INTEGER NOT NULL DEFAULT 0",
+    ),
+    # 0011: 分片验收租约表；旧库直接按当前定义新建，仅保存令牌哈希、分片与到期时间
+    (
+        "table",
+        "verification_leases",
+        """
+CREATE TABLE verification_leases (
+    token_hash    TEXT PRIMARY KEY,
+    session_id    TEXT NOT NULL,
+    chunk_index   INTEGER NOT NULL,
+    issued_at     TEXT NOT NULL,
+    expires_at    TEXT NOT NULL,
+    UNIQUE (session_id, chunk_index),
+    FOREIGN KEY (session_id, chunk_index) REFERENCES chunks(session_id, chunk_index)
+)
+        """,
+    ),
+    # 0012: 验收决定幂等记录表；保存每枚验收令牌的首次决定，重放原样返回、冲突决定 409
+    (
+        "table",
+        "verification_decisions",
+        """
+CREATE TABLE verification_decisions (
+    token_hash    TEXT PRIMARY KEY,
+    session_id    TEXT NOT NULL,
+    chunk_index   INTEGER NOT NULL,
+    decision      TEXT NOT NULL,
+    decided_at    TEXT NOT NULL,
+    FOREIGN KEY (session_id, chunk_index) REFERENCES chunks(session_id, chunk_index)
 )
         """,
     ),

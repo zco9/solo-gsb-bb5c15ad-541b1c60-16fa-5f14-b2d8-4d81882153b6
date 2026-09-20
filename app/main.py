@@ -28,7 +28,14 @@
   同一源会话 + request_id 重放返回首次新会话，参数变化返回 409
 - 就绪查询：会话与逐分片状态（含各分片依赖、失败次数与冷却截止时间，以及会话 revision
   与 source_session_id）
-- 就绪查询：当前可领取的分片、被依赖阻塞的分片以及退避冷却中的分片
+- 就绪查询：当前可领取的分片、被依赖阻塞的分片、退避冷却中的分片以及待验收分片
+- 分片验收队列（可选，创建会话 verification_required=true 启用）：启用后完成上报先进入
+  awaiting_verification（不再直接 completed），存在待验收分片时不可 finalize；
+  POST /verifications/lease 在同一写锁事务内按完成时间从早到晚领取一个待验收分片，
+  签发有 TTL 的验收令牌（仅存 SHA-256），未过期独占、过期可重领、并发请求不会重复领取；
+  POST /verifications/{session_id}/{chunk_index}/decide 携带当前令牌 approve 或 reject：
+  approve 转 completed，reject 在同一事务内原子清除摘要并回到 pending（可重新上传）；
+  同一令牌同一决定重放幂等、冲突决定返回 409。未启用会话保持原行为
 - 跨会话公平调度：POST /dispatch/lease 携带 queue_key、候选 session_ids 与 lease_ttl_seconds；
   候选会话去重后按（创建时间, id）稳定排序，服务端按 queue_key 持久化最近一次成功会话，
   在同一写锁事务内从其后循环扫描，从首个存在可领取分片且仍有并发槽位的会话领取序号最低的
@@ -58,6 +65,7 @@ from .schemas import (
     BatchLeaseRequest,
     BatchLeaseResponse,
     BlockedChunk,
+    CHUNK_STATUS_AWAITING_VERIFICATION,
     ChunkStatus,
     CompleteRequest,
     CompleteResponse,
@@ -68,6 +76,7 @@ from .schemas import (
     DISPATCH_REASON_BLOCKED,
     DISPATCH_REASON_DONE,
     DISPATCH_REASON_LEASED,
+    DISPATCH_REASON_AWAITING_VERIFICATION,
     DISPATCH_REASON_SESSION_FINALIZED,
     DISPATCH_REASON_SESSION_FULL,
     DISPATCH_REASON_SESSION_NOT_FOUND,
@@ -97,11 +106,23 @@ from .schemas import (
     TICKET_STATUS_ACTIVE,
     TICKET_STATUS_CONSUMED,
     TICKET_STATUS_REVOKED,
+    VERIFICATION_DECISION_APPROVE,
+    VERIFICATION_DECISION_REJECT,
+    VerificationDecideRequest,
+    VerificationDecideResponse,
+    VerificationLeaseRequest,
+    VerificationLeaseResponse,
     is_valid_merkle_digest,
 )
 
 DEFAULT_LEASE_TTL_SECONDS = int(os.environ.get("DEFAULT_LEASE_TTL_SECONDS", "300"))
 MAX_LEASE_TTL_SECONDS = int(os.environ.get("MAX_LEASE_TTL_SECONDS", "3600"))
+DEFAULT_VERIFICATION_TTL_SECONDS = int(
+    os.environ.get("DEFAULT_VERIFICATION_TTL_SECONDS", str(DEFAULT_LEASE_TTL_SECONDS))
+)
+MAX_VERIFICATION_TTL_SECONDS = int(
+    os.environ.get("MAX_VERIFICATION_TTL_SECONDS", str(MAX_LEASE_TTL_SECONDS))
+)
 DEFAULT_BASE_RETRY_SECONDS = int(os.environ.get("DEFAULT_BASE_RETRY_SECONDS", "5"))
 DEFAULT_MAX_RETRY_SECONDS = int(os.environ.get("DEFAULT_MAX_RETRY_SECONDS", "300"))
 
@@ -220,7 +241,7 @@ def missing_transitive_prerequisites(
 
 
 def incomplete_dependencies(session_id: str, chunk_index: int) -> list[int]:
-    """返回该分片尚未完成的前置分片（升序）。"""
+    """返回该分片尚未完成（含待验收）的前置分片（升序）。"""
     rows = get_conn().execute(
         "SELECT d.depends_on FROM chunk_dependencies d"
         " JOIN chunks c ON c.session_id = d.session_id AND c.chunk_index = d.depends_on"
@@ -279,10 +300,10 @@ def collect_reopen_affected(session_id: str, target: int) -> list[tuple[int, int
 
 
 def count_active_leases(session_id: str, now: datetime) -> int:
-    """会话内当前有效（未过期）租约数；已完成分片与过期租约均不计入。"""
+    """会话内当前有效（未过期）租约数；已完成/待验收分片与过期租约均不计入。"""
     return get_conn().execute(
         "SELECT COUNT(*) AS n FROM chunks"
-        " WHERE session_id = ? AND status != 'completed'"
+        " WHERE session_id = ? AND status = 'leased'"
         " AND lease_expires_at IS NOT NULL AND lease_expires_at > ?",
         (session_id, now.isoformat()),
     ).fetchone()["n"]
@@ -290,17 +311,17 @@ def count_active_leases(session_id: str, now: datetime) -> int:
 
 def earliest_wakeup(session_id: str, now: datetime) -> Optional[datetime]:
     """会话内最早的可重试时刻：有效租约的最早过期时间与各分片退避冷却的最早结束时间
-    中更早者；均不存在（或均已过期）时返回 None。"""
+    中更早者；均不存在（或均已过期）时返回 None。待验收分片不计入（由验收队列处理）。"""
     conn = get_conn()
     lease_row = conn.execute(
         "SELECT MIN(lease_expires_at) AS earliest FROM chunks"
-        " WHERE session_id = ? AND status != 'completed'"
+        " WHERE session_id = ? AND status = 'leased'"
         " AND lease_expires_at IS NOT NULL AND lease_expires_at > ?",
         (session_id, now.isoformat()),
     ).fetchone()
     backoff_row = conn.execute(
         "SELECT MIN(backoff_until) AS earliest FROM chunks"
-        " WHERE session_id = ? AND status != 'completed'"
+        " WHERE session_id = ? AND status = 'pending'"
         " AND backoff_until IS NOT NULL AND backoff_until > ?",
         (session_id, now.isoformat()),
     ).fetchone()
@@ -315,8 +336,9 @@ def earliest_wakeup(session_id: str, now: datetime) -> Optional[datetime]:
 def claimable_chunks(session_id: str, now: datetime) -> tuple[list[int], int]:
     """临界区内调用：返回（按序号升序的可领取分片列表, 被依赖阻塞的未完成分片数）。
 
-    可领取 = 未完成、无有效租约（过期租约视为空闲）、不在失败退避冷却中且前置分片全部完成；
-    被阻塞 = 未完成且至少一个前置分片尚未完成（无论该分片当前是否持有有效租约或处于冷却）。
+    可领取 = 未完成且非待验收、无有效租约（过期租约视为空闲）、不在失败退避冷却中且前置分片
+    全部完成；被阻塞 = 未完成（非待验收）且至少一个前置分片尚未完成（无论该分片当前是否持有
+    有效租约或处于冷却）。待验收分片既不可领取也不计入阻塞，由验收队列单独处理。
     """
     rows = get_conn().execute(
         "SELECT * FROM chunks WHERE session_id = ? ORDER BY chunk_index",
@@ -327,7 +349,7 @@ def claimable_chunks(session_id: str, now: datetime) -> tuple[list[int], int]:
     ready: list[int] = []
     blocked = 0
     for row in rows:
-        if row["status"] == "completed":
+        if row["status"] in ("completed", CHUNK_STATUS_AWAITING_VERIFICATION):
             continue
         chunk_index = row["chunk_index"]
         if any(d not in completed for d in deps.get(chunk_index, [])):
@@ -345,21 +367,22 @@ def dispatch_session_state(session_id: str, now: datetime):
     """临界区内调用：评估候选会话对跨会话调度的状态，全程复用单片/批量领取的同一套规则
     （有效租约、失败退避、依赖完成情况、max_active_leases 槽位均以同一谓词判定）。
 
-    返回 (session_row_or_None, ready, blocked, backoff_n, leased_n, active_leases)：
+    返回 (session_row_or_None, ready, blocked, backoff_n, leased_n, active_leases, awaiting_n)：
     - session_row_or_None：会话不存在时为 None（此时其余字段无意义）
     - ready：按序号升序、当前可领取（未完成 / 无有效租约 / 不在退避冷却 / 前置全完成）的分片
     - blocked：被未完成前置阻塞的未完成分片数
     - backoff_n：前置已完成但正处于失败退避冷却中的未完成分片数
     - leased_n：前置已完成、未在冷却但持有有效租约的未完成分片数
     - active_leases：会话当前有效（未过期）租约总数
-    已完成分片不计入以上任一分桶；四类分桶对未完成分片构成完备划分。
+    - awaiting_n：处于 awaiting_verification 的分片数（验收队列独占处理，不可被上传调度领取）
+    已完成分片不计入以上任一分桶；各分桶对未完成分片构成完备划分。
     """
     conn = get_conn()
     session = conn.execute(
         "SELECT * FROM sessions WHERE id = ?", (session_id,)
     ).fetchone()
     if session is None:
-        return None, [], 0, 0, 0, 0
+        return None, [], 0, 0, 0, 0, 0
     rows = conn.execute(
         "SELECT * FROM chunks WHERE session_id = ? ORDER BY chunk_index",
         (session_id,),
@@ -370,8 +393,12 @@ def dispatch_session_state(session_id: str, now: datetime):
     blocked = 0
     backoff_n = 0
     leased_n = 0
+    awaiting_n = 0
     for row in rows:
         if row["status"] == "completed":
+            continue
+        if row["status"] == CHUNK_STATUS_AWAITING_VERIFICATION:
+            awaiting_n += 1
             continue
         chunk_index = row["chunk_index"]
         if any(d not in completed for d in deps.get(chunk_index, [])):
@@ -384,7 +411,7 @@ def dispatch_session_state(session_id: str, now: datetime):
         else:
             ready.append(chunk_index)
     active_leases = count_active_leases(session_id, now)
-    return session, ready, blocked, backoff_n, leased_n, active_leases
+    return session, ready, blocked, backoff_n, leased_n, active_leases, awaiting_n
 
 
 # ---------------------------------------------------------------- 会话
@@ -404,11 +431,12 @@ def create_session(req: CreateSessionRequest):
         conn = get_conn()
         conn.execute(
             "INSERT INTO sessions (id, total_chunks, file_digest, digest_algorithm, status,"
-            " max_active_leases, base_retry_seconds, max_retry_seconds, created_at)"
-            " VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?)",
+            " max_active_leases, base_retry_seconds, max_retry_seconds,"
+            " verification_required, created_at)"
+            " VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)",
             (session_id, req.total_chunks, req.file_digest, req.digest_algorithm,
              req.max_active_leases, req.base_retry_seconds, req.max_retry_seconds,
-             now.isoformat()),
+             1 if req.verification_required else 0, now.isoformat()),
         )
         conn.executemany(
             "INSERT INTO chunks (session_id, chunk_index) VALUES (?, ?)",
@@ -429,6 +457,7 @@ def create_session(req: CreateSessionRequest):
         max_active_leases=req.max_active_leases,
         base_retry_seconds=req.base_retry_seconds,
         max_retry_seconds=req.max_retry_seconds,
+        verification_required=req.verification_required,
         created_at=now,
     )
 
@@ -447,9 +476,16 @@ def get_session_status(session_id: str):
     ).fetchall()
     deps = load_dependencies(session_id)
     now = utcnow()
+    # 待验收分片当前持有的验收令牌（含已过期）：(session_id, chunk_index) 至多一行
+    verification_rows = get_conn().execute(
+        "SELECT chunk_index, expires_at FROM verification_leases WHERE session_id = ?",
+        (session_id,),
+    ).fetchall()
+    verification_expiry = {r["chunk_index"]: r["expires_at"] for r in verification_rows}
 
     chunks: list[ChunkStatus] = []
     missing: list[int] = []
+    awaiting: list[int] = []
     for row in rows:
         status = row["status"]
         lease_expires_at = parse_ts(row["lease_expires_at"]) if row["lease_expires_at"] else None
@@ -460,6 +496,15 @@ def get_session_status(session_id: str):
         retry_after = parse_ts(row["backoff_until"]) if row["backoff_until"] else None
         if retry_after is not None and retry_after <= now:
             retry_after = None
+        # 待验收分片展示验收令牌到期时间：未领取或令牌已过期时为 null（仍可被重领）
+        verification_expires_at = None
+        if row["status"] == CHUNK_STATUS_AWAITING_VERIFICATION:
+            awaiting.append(row["chunk_index"])
+            raw_verification_expiry = verification_expiry.get(row["chunk_index"])
+            if raw_verification_expiry is not None:
+                parsed = parse_ts(raw_verification_expiry)
+                if parsed > now:
+                    verification_expires_at = parsed
         if row["status"] != "completed":
             missing.append(row["chunk_index"])
         chunks.append(
@@ -472,6 +517,7 @@ def get_session_status(session_id: str):
                 dependencies=deps.get(row["chunk_index"], []),
                 failure_count=row["failure_count"] or 0,
                 retry_after=retry_after,
+                verification_expires_at=verification_expires_at,
             )
         )
 
@@ -488,6 +534,8 @@ def get_session_status(session_id: str):
         max_active_leases=session["max_active_leases"],
         base_retry_seconds=session["base_retry_seconds"],
         max_retry_seconds=session["max_retry_seconds"],
+        verification_required=bool(session["verification_required"]),
+        awaiting_verification_chunks=awaiting,
         active_leases=sum(
             1 for c in chunks
             if c.status == "leased" and c.lease_expires_at is not None
@@ -524,6 +572,7 @@ def build_fork_response(
         max_active_leases=session["max_active_leases"],
         base_retry_seconds=session["base_retry_seconds"],
         max_retry_seconds=session["max_retry_seconds"],
+        verification_required=bool(session["verification_required"]),
         created_at=created_at,
         idempotent_replay=idempotent_replay,
     )
@@ -628,12 +677,12 @@ def fork_session(session_id: str, req: ForkSessionRequest):
         conn.execute(
             "INSERT INTO sessions (id, total_chunks, file_digest, digest_algorithm, status,"
             " max_active_leases, base_retry_seconds, max_retry_seconds, revision,"
-            " source_session_id, created_at)"
-            " VALUES (?, ?, ?, ?, 'active', ?, ?, ?, 0, ?, ?)",
+            " source_session_id, verification_required, created_at)"
+            " VALUES (?, ?, ?, ?, 'active', ?, ?, ?, 0, ?, ?, ?)",
             (new_id, session["total_chunks"], session["file_digest"],
              session["digest_algorithm"], session["max_active_leases"],
              session["base_retry_seconds"], session["max_retry_seconds"],
-             session_id, now.isoformat()),
+             session_id, session["verification_required"], now.isoformat()),
         )
         # 复用分片：复制摘要与完成时间为 completed；其余默认 pending。
         # 不复制 lease_token / lease_expires_at / backoff_until / failure_count
@@ -701,9 +750,14 @@ def get_ready_chunks(session_id: str):
     ready: list[int] = []
     blocked: list[BlockedChunk] = []
     cooling: list[CoolingChunk] = []
+    awaiting: list[int] = []
     for row in rows:
         chunk_index = row["chunk_index"]
         if row["status"] == "completed":
+            continue
+        if row["status"] == CHUNK_STATUS_AWAITING_VERIFICATION:
+            # 已完成上报、等待验收：既不可领取也不属于阻塞/冷却，验收后才离开该状态
+            awaiting.append(chunk_index)
             continue
         missing_deps = [d for d in deps.get(chunk_index, []) if d not in completed]
         if missing_deps:
@@ -728,6 +782,7 @@ def get_ready_chunks(session_id: str):
         ready_chunks=ready,
         blocked_chunks=blocked,
         cooling_chunks=cooling,
+        awaiting_verification_chunks=awaiting,
     )
 
 
@@ -758,6 +813,11 @@ def claim_lease(
 
         if chunk["status"] == "completed":
             raise HTTPException(status_code=409, detail="chunk already completed")
+        if chunk["status"] == CHUNK_STATUS_AWAITING_VERIFICATION:
+            raise HTTPException(
+                status_code=409,
+                detail="chunk is awaiting verification and cannot be leased again",
+            )
         if lease_valid(chunk, now):
             return conflict(
                 "chunk lease already held",
@@ -946,8 +1006,8 @@ def dispatch_lease(req: DispatchLeaseRequest):
                 ))
                 continue
 
-            _, ready, blocked, backoff_n, leased_n, active = dispatch_session_state(
-                sid, now
+            _, ready, blocked, backoff_n, leased_n, active, awaiting_n = (
+                dispatch_session_state(sid, now)
             )
 
             if ready:
@@ -1016,13 +1076,13 @@ def dispatch_lease(req: DispatchLeaseRequest):
                 # 两类等待事件同时存在：以更早的整体唤醒时刻所属的类型为主因
                 lease_earliest = conn.execute(
                     "SELECT MIN(lease_expires_at) AS earliest FROM chunks"
-                    " WHERE session_id = ? AND status != 'completed'"
+                    " WHERE session_id = ? AND status = 'leased'"
                     " AND lease_expires_at IS NOT NULL AND lease_expires_at > ?",
                     (sid, now.isoformat()),
                 ).fetchone()["earliest"]
                 backoff_earliest = conn.execute(
                     "SELECT MIN(backoff_until) AS earliest FROM chunks"
-                    " WHERE session_id = ? AND status != 'completed'"
+                    " WHERE session_id = ? AND status = 'pending'"
                     " AND backoff_until IS NOT NULL AND backoff_until > ?",
                     (sid, now.isoformat()),
                 ).fetchone()["earliest"]
@@ -1037,6 +1097,10 @@ def dispatch_lease(req: DispatchLeaseRequest):
             elif blocked:
                 reason = DISPATCH_REASON_BLOCKED
                 detail = "all unfinished chunks blocked by unfinished dependencies"
+            elif awaiting_n:
+                # 剩余未完成分片全部待验收：上传调度无可发放项，须由验收队列 approve/reject
+                reason = DISPATCH_REASON_AWAITING_VERIFICATION
+                detail = "all unfinished chunks are awaiting verification"
             else:
                 reason = DISPATCH_REASON_DONE
                 detail = "all chunks already completed"
@@ -1085,13 +1149,13 @@ def complete_chunk(session_id: str, chunk_index: int, req: CompleteRequest):
                        "for sha256-merkle-v1 sessions",
             )
 
-        if chunk["status"] == "completed":
-            # 幂等重放：同一租约令牌 + 同一摘要 => 返回首次完成结果
+        if chunk["status"] in ("completed", CHUNK_STATUS_AWAITING_VERIFICATION):
+            # 幂等重放：同一租约令牌 + 同一摘要 => 返回首次完成结果（状态为当前所处状态）
             if chunk["lease_token"] == req.lease_token and chunk["chunk_digest"] == req.chunk_digest:
                 return CompleteResponse(
                     session_id=session_id,
                     chunk_index=chunk_index,
-                    status="completed",
+                    status=chunk["status"],
                     chunk_digest=chunk["chunk_digest"],
                     completed_at=parse_ts(chunk["completed_at"]),
                     idempotent_replay=True,
@@ -1108,18 +1172,25 @@ def complete_chunk(session_id: str, chunk_index: int, req: CompleteRequest):
         if not lease_valid(chunk, now):
             raise HTTPException(status_code=409, detail="lease expired")
 
+        # 启用验收队列：完成上报先进入 awaiting_verification，验收 approve 后才转 completed；
+        # 未启用会话保持原行为，直接 completed。两种情况下退避冷却都随完成上报清除。
+        new_status = (
+            CHUNK_STATUS_AWAITING_VERIFICATION
+            if session["verification_required"]
+            else "completed"
+        )
         get_conn().execute(
-            "UPDATE chunks SET status = 'completed', chunk_digest = ?, completed_at = ?,"
+            "UPDATE chunks SET status = ?, chunk_digest = ?, completed_at = ?,"
             " backoff_until = NULL"
             " WHERE session_id = ? AND chunk_index = ?",
-            (req.chunk_digest, now.isoformat(), session_id, chunk_index),
+            (new_status, req.chunk_digest, now.isoformat(), session_id, chunk_index),
         )
         get_conn().commit()
 
     return CompleteResponse(
         session_id=session_id,
         chunk_index=chunk_index,
-        status="completed",
+        status=new_status,
         chunk_digest=req.chunk_digest,
         completed_at=now,
         idempotent_replay=False,
@@ -1145,6 +1216,11 @@ def fail_chunk(session_id: str, chunk_index: int, req: FailRequest):
 
         if chunk["status"] == "completed":
             raise HTTPException(status_code=409, detail="chunk already completed")
+        if chunk["status"] == CHUNK_STATUS_AWAITING_VERIFICATION:
+            raise HTTPException(
+                status_code=409,
+                detail="chunk is awaiting verification and cannot report failure",
+            )
         if session["status"] == "finalized":
             raise HTTPException(status_code=409, detail="session already finalized")
         if chunk["lease_token"] is None or chunk["lease_token"] != req.lease_token:
@@ -1195,6 +1271,11 @@ def reopen_chunk(session_id: str, chunk_index: int, req: ReopenRequest):
 
         if session["status"] == "finalized":
             raise HTTPException(status_code=409, detail="session already finalized")
+        if chunk["status"] == CHUNK_STATUS_AWAITING_VERIFICATION:
+            raise HTTPException(
+                status_code=409,
+                detail="chunk is awaiting verification; reject it instead of reopening",
+            )
         if chunk["status"] != "completed":
             raise HTTPException(status_code=409, detail="chunk is not completed")
         if chunk["lease_token"] is None or chunk["lease_token"] != req.lease_token:
@@ -1210,6 +1291,11 @@ def reopen_chunk(session_id: str, chunk_index: int, req: ReopenRequest):
             " lease_expires_at = NULL, chunk_digest = NULL, completed_at = NULL,"
             " backoff_until = NULL"
             " WHERE session_id = ? AND chunk_index = ?",
+            [(session_id, idx) for idx, _ in affected],
+        )
+        # 受影响分片中若存在残留的待验收租约行（理论上仅可能是历史脏数据），一并清除
+        conn.executemany(
+            "DELETE FROM verification_leases WHERE session_id = ? AND chunk_index = ?",
             [(session_id, idx) for idx, _ in affected],
         )
         conn.execute(
@@ -1482,6 +1568,214 @@ def revoke_delivery_ticket(req: RevokeDeliveryTicketRequest):
     )
 
 
+# ---------------------------------------------------------------- 分片验收队列
+
+def hash_verification_token(token: str) -> str:
+    """验收令牌不落库：仅保存其 SHA-256 十六进制摘要。"""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+@app.post(
+    "/verifications/lease",
+    response_model=VerificationLeaseResponse,
+    status_code=201,
+    tags=["verifications"],
+    summary="按完成时间领取一个待验收分片，签发有 TTL 的验收令牌",
+    responses={
+        409: {"description": "当前没有任何可领取（未持有有效验收令牌）的待验收分片"},
+    },
+)
+def lease_verification(req: Optional[VerificationLeaseRequest] = Body(default=None)):
+    """在同一 DB_LOCK 写事务内：跨全部启用验收队列的会话，按完成时间（completed_at,
+    session_id, chunk_index）从早到晚找到首个 awaiting_verification 分片：
+
+    - 无验收租约或验收租约已过期 => 领取成功，签发新的随机验收令牌（库内仅存 SHA-256 与
+      到期时间），同一分片的旧租约行被原子替换；未过期令牌独占，重复/并发请求得到 409；
+    - 所有待验收分片均持有未过期验收令牌（或根本不存在待验收分片）=> 409，不做任何写入。
+
+    领取后验收方可凭令牌在 TTL 内 decide；令牌过期不改变分片状态（仍为 awaiting_verification），
+    可被任意请求重新领取并换发新令牌，旧令牌随即失效。
+    """
+    ttl = DEFAULT_VERIFICATION_TTL_SECONDS
+    if req is not None and req.lease_ttl_seconds is not None:
+        ttl = min(req.lease_ttl_seconds, MAX_VERIFICATION_TTL_SECONDS)
+
+    now = utcnow()
+    now_iso = now.isoformat()
+    with DB_LOCK:
+        conn = get_conn()
+        # 完成时间 FIFO：同刻以 (session_id, chunk_index) 破序，结果确定。
+        # LEFT JOIN：从未被领取过的待验收分片（无 verification_leases 行）同样可领取；
+        # 已领取但令牌过期（expires_at <= now）也可重领；未过期的行被 WHERE 过滤。
+        row = conn.execute(
+            "SELECT c.session_id AS session_id, c.chunk_index AS chunk_index,"
+            " c.chunk_digest AS chunk_digest, c.completed_at AS completed_at"
+            " FROM chunks c"
+            " JOIN sessions s ON s.id = c.session_id"
+            " LEFT JOIN verification_leases v"
+            "   ON v.session_id = c.session_id AND v.chunk_index = c.chunk_index"
+            " WHERE c.status = ? AND s.verification_required = 1"
+            " AND (v.expires_at IS NULL OR v.expires_at <= ?)"
+            " ORDER BY c.completed_at, c.session_id, c.chunk_index"
+            " LIMIT 1",
+            (CHUNK_STATUS_AWAITING_VERIFICATION, now_iso),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(
+                status_code=409,
+                detail="no awaiting verification chunk available",
+            )
+
+        token = secrets.token_urlsafe(32)
+        token_hash = hash_verification_token(token)
+        expires_at = now + timedelta(seconds=ttl)
+        # UPSERT：同一分片至多一行当前验收租约；过期重领以新令牌/新到期时间原子换发。
+        # 资格检查与写入在同一临界区，并发请求串行化后只有一个能领取任一分片。
+        conn.execute(
+            "INSERT INTO verification_leases"
+            " (token_hash, session_id, chunk_index, issued_at, expires_at)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(session_id, chunk_index) DO UPDATE SET"
+            " token_hash = excluded.token_hash, issued_at = excluded.issued_at,"
+            " expires_at = excluded.expires_at",
+            (token_hash, row["session_id"], row["chunk_index"],
+             now_iso, expires_at.isoformat()),
+        )
+        conn.commit()
+
+    return VerificationLeaseResponse(
+        session_id=row["session_id"],
+        chunk_index=row["chunk_index"],
+        verification_token=token,
+        chunk_digest=row["chunk_digest"],
+        completed_at=parse_ts(row["completed_at"]),
+        issued_at=now,
+        expires_at=expires_at,
+    )
+
+
+@app.post(
+    "/verifications/{session_id}/{chunk_index}/decide",
+    response_model=VerificationDecideResponse,
+    tags=["verifications"],
+    summary="凭当前验收令牌对一个待验收分片作出 approve / reject 决定",
+    responses={
+        404: {"description": "会话或分片不存在"},
+        409: {"description": "分片不在待验收状态、验收令牌不匹配/已过期，"
+                             "或同一令牌携带与首次不同的冲突决定"},
+    },
+)
+def decide_verification(session_id: str, chunk_index: int, req: VerificationDecideRequest):
+    """在同一 DB_LOCK 写事务内校验并落决定：
+
+    - 幂等优先：同一验收令牌 + 同一决定重放（含并发重试）原样返回首次结果；
+      同一令牌携带冲突决定返回 409（一枚令牌只能作一次决定）；
+    - 分片必须仍为 awaiting_verification；令牌须为该分片当前（未过期）验收令牌，
+      否则返回 409（令牌不匹配/已过期/已被新令牌换发）；
+    - approve：分片转 completed（摘要与完成时间沿用完成上报值）；
+    - reject：原子清除摘要与完成时间、分片回到 pending（同时清除上传租约与退避冷却，
+      保留累计失败次数），可立即重新领取上传租约重传。
+    成功后删除该分片的当前验收租约行，并写入按令牌哈希唯一的决定记录。
+    """
+    now = utcnow()
+    token_hash = hash_verification_token(req.verification_token)
+    with DB_LOCK:
+        conn = get_conn()
+        get_session_or_404(session_id)
+        chunk = get_chunk_or_404(session_id, chunk_index)
+
+        decision_row = conn.execute(
+            "SELECT * FROM verification_decisions WHERE token_hash = ?",
+            (token_hash,),
+        ).fetchone()
+        if decision_row is not None:
+            # 该令牌已被使用：URL 必须指向令牌当初作决定的分片，否则按令牌不匹配拒绝
+            if (decision_row["session_id"] != session_id
+                    or decision_row["chunk_index"] != chunk_index):
+                raise HTTPException(
+                    status_code=409, detail="verification token mismatch")
+            # 同枚令牌已有决定：同决定幂等返回首次结果，不同决定冲突
+            if decision_row["decision"] != req.decision:
+                return conflict(
+                    "verification token already used with a conflicting decision",
+                    original_decision=decision_row["decision"],
+                )
+            current = conn.execute(
+                "SELECT status, chunk_digest FROM chunks"
+                " WHERE session_id = ? AND chunk_index = ?",
+                (session_id, chunk_index),
+            ).fetchone()
+            return VerificationDecideResponse(
+                session_id=session_id,
+                chunk_index=chunk_index,
+                decision=req.decision,
+                status=current["status"],
+                chunk_digest=current["chunk_digest"],
+                decided_at=parse_ts(decision_row["decided_at"]),
+                idempotent_replay=True,
+            )
+
+        if chunk["status"] != CHUNK_STATUS_AWAITING_VERIFICATION:
+            raise HTTPException(
+                status_code=409,
+                detail="chunk is not awaiting verification",
+            )
+        lease_row = conn.execute(
+            "SELECT * FROM verification_leases"
+            " WHERE session_id = ? AND chunk_index = ?",
+            (session_id, chunk_index),
+        ).fetchone()
+        if lease_row is None or lease_row["token_hash"] != token_hash:
+            # 令牌不属于该分片当前验收租约（从未领取、过期后已被换发或用于其他分片）
+            raise HTTPException(status_code=409, detail="verification token mismatch")
+        if parse_ts(lease_row["expires_at"]) <= now:
+            raise HTTPException(status_code=409, detail="verification token expired")
+
+        if req.decision == VERIFICATION_DECISION_APPROVE:
+            new_status = "completed"
+            conn.execute(
+                "UPDATE chunks SET status = 'completed'"
+                " WHERE session_id = ? AND chunk_index = ?",
+                (session_id, chunk_index),
+            )
+            result_digest = chunk["chunk_digest"]
+        else:
+            # reject：原子清除摘要/完成时间并回到 pending；同时清除上传租约与退避冷却，
+            # failure_count 保留，分片可立即被重新领取重传
+            new_status = "pending"
+            conn.execute(
+                "UPDATE chunks SET status = 'pending', chunk_digest = NULL,"
+                " completed_at = NULL, lease_token = NULL, lease_expires_at = NULL,"
+                " backoff_until = NULL"
+                " WHERE session_id = ? AND chunk_index = ?",
+                (session_id, chunk_index),
+            )
+            result_digest = None
+
+        # 决定落库（token_hash 主键保证一枚令牌至多一个决定），随后删除当前验收租约
+        conn.execute(
+            "INSERT INTO verification_decisions"
+            " (token_hash, session_id, chunk_index, decision, decided_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (token_hash, session_id, chunk_index, req.decision, now.isoformat()),
+        )
+        conn.execute(
+            "DELETE FROM verification_leases WHERE session_id = ? AND chunk_index = ?",
+            (session_id, chunk_index),
+        )
+        conn.commit()
+
+    return VerificationDecideResponse(
+        session_id=session_id,
+        chunk_index=chunk_index,
+        decision=req.decision,
+        status=new_status,
+        chunk_digest=result_digest,
+        decided_at=now,
+        idempotent_replay=False,
+    )
+
+
 # ---------------------------------------------------------------- 其他
 
 @app.get("/healthz", tags=["meta"], summary="健康检查")
@@ -1498,6 +1792,8 @@ def root():
         "openapi": "/openapi.json",
         "default_lease_ttl_seconds": DEFAULT_LEASE_TTL_SECONDS,
         "max_lease_ttl_seconds": MAX_LEASE_TTL_SECONDS,
+        "default_verification_ttl_seconds": DEFAULT_VERIFICATION_TTL_SECONDS,
+        "max_verification_ttl_seconds": MAX_VERIFICATION_TTL_SECONDS,
         "default_base_retry_seconds": DEFAULT_BASE_RETRY_SECONDS,
         "default_max_retry_seconds": DEFAULT_MAX_RETRY_SECONDS,
     }

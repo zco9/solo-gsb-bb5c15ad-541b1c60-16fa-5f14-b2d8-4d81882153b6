@@ -32,6 +32,8 @@ docker compose up --build
 | `UPLOAD_DB_PATH` | `/data/coordinator.db` | SQLite 数据库文件路径 |
 | `DEFAULT_LEASE_TTL_SECONDS` | `300` | 租约默认有效期（秒） |
 | `MAX_LEASE_TTL_SECONDS` | `3600` | 租约有效期上限（秒），超出会被截断 |
+| `DEFAULT_VERIFICATION_TTL_SECONDS` | `300` | 验收令牌默认有效期（秒），缺省跟随 `DEFAULT_LEASE_TTL_SECONDS` |
+| `MAX_VERIFICATION_TTL_SECONDS` | `3600` | 验收令牌有效期上限（秒），缺省跟随 `MAX_LEASE_TTL_SECONDS` |
 | `DEFAULT_BASE_RETRY_SECONDS` | `5` | 创建会话未显式指定时的失败退避基数（秒） |
 | `DEFAULT_MAX_RETRY_SECONDS` | `300` | 创建会话未显式指定时的失败退避冷却上限（秒） |
 
@@ -43,7 +45,7 @@ docker compose up --build
 - **依赖（可选）**：创建会话时可提交 `dependencies`（键与值均为分片序号），声明某分片领取租约前必须完成的前置分片。越界、自依赖、有环的依赖图会被拒绝（`422`）；不提供时保持无依赖的原有行为。
 - **租约**：同一分片同一时刻仅允许一个有效租约；租约过期后可被重新领取（令牌轮换）。前置分片未全部完成时领取返回 `409` 及按序缺失的 `missing_dependencies`；前置全部完成后无需额外操作即可领取。
 - **失败上报与退避重试（可选自动生效）**：`POST /sessions/{id}/chunks/{index}/fail` 必须携带该分片**当前有效租约的令牌**；校验通过后在同一事务内**原子清除租约、`failure_count` 加 1**，并将分片置于退避冷却中，第 n 次失败冷却 `min(max_retry_seconds, base_retry_seconds × 2^(n-1))` 秒（默认序列 5、10、20、40、80、160、300、300…）。冷却中的分片**单片与批量领取均跳过/拒绝**，`/ready` 单独列出 `cooling_chunks`；冷却结束后无需干预即可重新领取。令牌不匹配、租约已过期、分片已完成或会话已提交均返回 `409`。
-- **完成上报**：必须携带该分片**当前有效租约的令牌**与分片摘要；以相同令牌 + 相同摘要重复上报为幂等成功（返回 `idempotent_replay: true`），摘要不同则返回 `409`。完成后**清除退避冷却但保留 `failure_count`**。
+- **完成上报**：必须携带该分片**当前有效租约的令牌**与分片摘要；以相同令牌 + 相同摘要重复上报为幂等成功（返回 `idempotent_replay: true`），摘要不同则返回 `409`。完成后**清除退避冷却但保留 `failure_count`**。普通会话完成即 `completed`；**启用分片验收队列**的会话先进入 `awaiting_verification`（见下文「分片验收队列」）。
 - **完成纠错回退（reopen）**：`POST /sessions/{id}/chunks/{index}/reopen` 凭目标分片**完成时保留的租约令牌**与 `expected_digest`（完成时上报的摘要）发起，仅允许**未提交会话中已完成且凭据匹配**的分片。校验通过后服务端沿依赖图找出**全部传递下游**，在**同一事务**内将目标及下游重置为 `pending`：清除摘要、完成时间、有效租约与退避截止时间，**保留累计失败次数**；同时会话 `revision` 递增 1。响应中的 `affected_chunks` 按**（拓扑层级, 分片序号）**升序稳定排列（目标层级为 0，层级取受影响子图中的最长路径）。任一校验失败（会话已提交 / 分片未完成 / 凭据不匹配）返回 `409` 且**不产生任何部分回退**；整个回退与并发领取互斥，领取方不会看到中间状态。
 - **进度分支（fork）**：`POST /sessions/{id}/fork` 从一个 **`active`** 会话分叉出全新的上传会话，请求体包含 `expected_revision`（调用方认为源会话所处的修订号，不匹配返回 `409` 及 `current_revision`）、幂等键 `request_id` 与 `reuse_chunks`（要复用进度的分片序号列表，可为空）。仅当 `reuse_chunks` 中**每一项都已在源会话完成**（越界序号按未完成处理，响应以 `not_completed_chunks` 返回），且集合**包含这些分片的全部传递前置分片**（缺失项以 `missing_prerequisites` 升序返回）时才会创建；任一校验失败返回 `409` 且**不落库**。新会话复制源会话的**全部配置**（总分片数、文件摘要、摘要算法、并发上限、退避参数）与**完整依赖图**：复用分片的**摘要与完成时间**复制为 `completed`，其余分片初始化为 `pending`；**不复制**租约（令牌/过期时间）、退避冷却与累计失败次数。新会话 `revision` 从 0 开始、状态为 `active`，与源会话相互独立。**同一源会话 + 同一 `request_id` 的重放**（含仅顺序/重复不同的 `reuse_chunks`）返回**首次创建的新会话**（`200`、`idempotent_replay: true`）；相同键但 `expected_revision` 或 `reuse_chunks` 变化返回 `409`。已提交（`finalized`）的会话不可再分支。
 - **会话级并发上限（可选）**：创建会话时可设置 `max_active_leases`，限制该会话**当前有效（未过期）租约**的总数。单片领取在槽位占满时返回 `409`；批量领取则原子地领取至多 `min(count, 剩余槽位, 可领取分片数)` 个租约。不设置（`null`）时保持原有不限并发的行为。
@@ -54,6 +56,118 @@ docker compose up --build
   - **兑换**：`POST /delivery-tickets/redeem` 携带 `token` 与调用方生成的幂等键 `request_id`，在**同一写事务**内依次校验**未消费、未撤销、未过期**，通过后原子地把凭证置为 `consumed` 并返回该会话**按分片序号升序的 manifest**（与 finalize 清单一致）及 `redeemed_at`。**并发的不同 `request_id` 只有一个成功**（其余 `409 already consumed`）；**同一 `request_id` 的重放（含并发重试）返回与首次完全相同的结果**——首次响应被原样持久化，即使此后凭证已过期或被撤销。已撤销（`409 revoked`）、已过期（`409 expired`）或已被其它 `request_id` 消费（`409 already consumed`）的凭证均不可领取；未知令牌返回 `404`。
   - **撤销**：`POST /delivery-tickets/revoke` 携带 `token`，将未消费凭证置为 `revoked`（**已消费凭证不可撤销**，返回 `409`；已过期但未消费的凭证仍可撤销）；对已撤销凭证重复撤销幂等成功（`already_revoked: true`）。撤销后任何兑换请求都返回 `409`。
 - 已完成的分片不可再领取租约；已提交的会话进入只读状态。
+
+## 分片验收队列（verification_required，可选）
+
+创建会话时设置 `"verification_required": true` 即启用**分片验收队列**；缺省（`false`）时
+完成上报直接转 `completed`，全部既有行为保持不变。启用后上传与验收解耦：上报方负责传分片，
+验收方按队列独立审核。
+
+启用后的状态机：
+
+```
+pending --(领取上传租约)--> leased --(complete：令牌+摘要匹配)--> awaiting_verification
+                                                                   |
+                              +------------------------------------+-----------------------------------+
+                              |                                                                                                |
+                  POST /verifications/lease 领取并签发有 TTL 的验收令牌（FIFO，全局队列）                                       |
+                              |                                                                                                |
+                  decide approve                                              decide reject
+                              |                                                                                                |
+                              v                                                                                                v
+                        completed（沿用上报摘要/完成时间）                              pending（原子清除摘要/完成时间与上传租约，
+                                                                                         保留 failure_count，可立即重新领取重传）
+```
+
+规则要点：
+
+- **完成上报先待验收**：启用会话的 complete 成功后分片为 `awaiting_verification`（幂等重放
+  亦返回该状态），**不再直接 `completed`**。待验收分片：
+  - 不能再次领取上传租约、不能 `fail`、不能 `reopen`（均 `409`，驳回请走 reject）；
+  - **不计入** `/ready` 的 `ready_chunks` / `blocked_chunks` / `cooling_chunks`，而单独列入
+    `awaiting_verification_chunks`；会话状态接口同时给出会话级 `awaiting_verification_chunks`
+    列表与逐分片的 `verification_expires_at`（当前验收令牌到期时间，未领取/已过期为 `null`）；
+  - 对依赖图而言仍是「未完成」：下游分片的前置若处于待验收，下游依旧不可领取；
+  - 跨会话调度跳过这种会话，原因报告为 `chunks_awaiting_verification`。
+- **未验收不得提交**：只要存在非 `completed` 分片（含待验收），`finalize` 返回 `409` 且
+  `missing_chunks` 包含待验收分片；全部 approve 后才可正常提交（含 Merkle 校验）。
+- **领取验收任务**：`POST /verifications/lease`（请求体可省略，或携带 `lease_ttl_seconds`）
+  在**同一写锁事务**内跨全部启用会话，按**完成时间从早到晚**（`completed_at`，同刻以
+  `session_id`、`chunk_index` 破序）领取**一个**当前可领取的待验收分片，返回
+  `session_id` / `chunk_index` / `chunk_digest`（供验收方核对）/ `completed_at` 与一枚
+  **一次性验收令牌** `verification_token`（明文仅此一次返回，库内只存其 SHA-256）及
+  `issued_at` / `expires_at`。
+  - 未持有有效验收令牌（从未领取或令牌已过期）的分片才可领取；**未过期令牌独占**，
+    重复或并发请求**不会重复领取**——其余分片被领完后返回 `409 no awaiting verification
+    chunk available`，不做任何写入。
+  - **过期可重领**：令牌到期后分片仍是 `awaiting_verification`，任意请求可重新领取，
+    旧令牌随即失效（同一分片的租约行被原子换发，库内每分片至多一行）。
+- **作出决定**：`POST /verifications/{session_id}/{chunk_index}/decide` 携带
+  `verification_token` 与 `decision`（`approve` / `reject`）：
+  - `approve`：分片转 **`completed`**，摘要与完成时间沿用完成上报值；
+  - `reject`：**在同一事务内原子清除摘要与完成时间**、分片回到 **`pending`**（同时清除
+    上传租约与退避冷却，**保留累计失败次数**），可立即重新领取上传租约重传；
+  - 令牌必须是该分片**当前未过期**的验收令牌：未知/不匹配/已过期/已被换发均 `409`；
+    分片已不在待验收状态返回 `409`；会话或分片不存在返回 `404`。
+  - **同一令牌同一决定重放幂等**：返回首次结果（`idempotent_replay: true`、首次的
+    `decided_at` 与分片状态），并发重放同样安全；**同一令牌携带冲突决定返回 `409`**
+    （响应体带首次的 `original_decision`），分片维持首次决定结果。
+- **进度分支**：fork 复制会话的 `verification_required` 开关；待验收分片不属于
+  `completed`，不能作为 `reuse_chunks` 复用（返回 `409 not_completed_chunks`）。
+- **未启用会话完全不受影响**：complete 直接 `completed`，`/verifications/lease` 在全局
+  没有待验收分片时返回 `409`。
+
+调用示例（curl）：
+
+```bash
+# 1. 创建启用验收队列的会话并逐分片领取/上报完成（complete 返回 awaiting_verification）
+SID=$(curl -s -X POST http://localhost:8000/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"total_chunks": 2, "file_digest": "<文件摘要>", "verification_required": true}' \
+  | python3 -c 'import sys, json; print(json.load(sys.stdin)["id"])')
+TOKEN=$(curl -s -X POST http://localhost:8000/sessions/$SID/chunks/0/lease \
+  | python3 -c 'import sys, json; print(json.load(sys.stdin)["lease_token"])')
+curl -s -X POST http://localhost:8000/sessions/$SID/chunks/0/complete \
+  -H 'Content-Type: application/json' \
+  -d "{\"lease_token\": \"$TOKEN\", \"chunk_digest\": \"<分片0摘要>\"}"
+# => {"status": "awaiting_verification", ...}
+
+# 2. 此时不能提交：missing_chunks 包含待验收分片
+curl -s -X POST http://localhost:8000/sessions/$SID/finalize
+# => 409 {"detail": "upload incomplete", "missing_chunks": [0, 1]}
+
+# 3. 验收方按完成时间 FIFO 领取一个待验收分片（TTL 600 秒）
+VT=$(curl -s -X POST http://localhost:8000/verifications/lease \
+  -H 'Content-Type: application/json' -d '{"lease_ttl_seconds": 600}')
+echo "$VT"
+# => 201 {"session_id": "...", "chunk_index": 0, "chunk_digest": "<分片0摘要>",
+#         "verification_token": "Rk9...（仅此一次）", "issued_at": "...", "expires_at": "..."}
+VTOKEN=$(echo "$VT" | python3 -c 'import sys, json; print(json.load(sys.stdin)["verification_token"])')
+
+# 4a. 验收通过 -> completed；重放同决定幂等；冲突决定 409
+curl -s -X POST http://localhost:8000/verifications/$SID/0/decide \
+  -H 'Content-Type: application/json' \
+  -d "{\"verification_token\": \"$VTOKEN\", \"decision\": \"approve\"}"
+# => {"decision": "approve", "status": "completed", "chunk_digest": "<分片0摘要>", ...}
+
+# 4b. 或验收驳回 -> pending（摘要被清除，可重新领取上传租约重传）
+curl -s -X POST http://localhost:8000/verifications/$SID/0/decide \
+  -H 'Content-Type: application/json' \
+  -d "{\"verification_token\": \"$VTOKEN\", \"decision\": \"reject\"}"
+# => {"decision": "reject", "status": "pending", "chunk_digest": null, ...}
+
+# 5. 状态与就绪查询区分待验收分片
+curl -s http://localhost:8000/sessions/$SID
+# => {"verification_required": true, "awaiting_verification_chunks": [0],
+#     "chunks": [{"chunk_index": 0, "status": "awaiting_verification",
+#                 "verification_expires_at": "2026-...（未过期令牌）", ...}, ...], ...}
+curl -s http://localhost:8000/sessions/$SID/ready
+# => {"ready_chunks": [], "blocked_chunks": [], "cooling_chunks": [],
+#     "awaiting_verification_chunks": [0]}
+
+# 6. 验收令牌过期后可被重新领取（换发新令牌，旧令牌失效）；全部分片 approve 后即可提交
+curl -s -X POST http://localhost:8000/sessions/$SID/finalize
+```
 
 ## 完整性校验（sha256-merkle-v1，可选）
 
@@ -121,20 +235,22 @@ curl -s -X POST http://localhost:8000/sessions/$SID/finalize
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/sessions` | 创建上传会话（可选 `dependencies` 依赖图、`max_active_leases` 并发上限、`base_retry_seconds`/`max_retry_seconds` 退避参数） |
+| `POST` | `/sessions` | 创建上传会话（可选 `dependencies` 依赖图、`max_active_leases` 并发上限、`base_retry_seconds`/`max_retry_seconds` 退避参数、`verification_required` 分片验收队列） |
 | `GET` | `/sessions/{session_id}` | 查询会话与逐分片状态（含各分片 `dependencies`、`failure_count`、`retry_after`、退避参数、当前 `active_leases`、会话 `revision` 与 `source_session_id`） |
 | `POST` | `/sessions/{session_id}/fork` | 进度分支：从 active 会话创建新会话，复用已完成分片进度（校验修订号/完成状态/传递前置闭包，`request_id` 幂等） |
 | `GET` | `/sessions/{session_id}/ready` | 当前可领取的分片、被依赖阻塞的分片，以及退避冷却中的分片（`cooling_chunks`） |
 | `POST` | `/sessions/{session_id}/chunks/{index}/lease` | 领取分片租约（同样受 `max_active_leases` 与退避冷却约束） |
 | `POST` | `/sessions/{session_id}/leases/batch` | 原子批量领取租约（按分片序号，数量不超过 `count` 与剩余并发槽位；自动跳过冷却分片） |
 | `POST` | `/dispatch/lease` | 跨会话公平调度：在候选会话间轮转发一片分片租约（按 `queue_key` 持久化游标，自动跳过不可用会话） |
-| `POST` | `/sessions/{session_id}/chunks/{index}/complete` | 上报分片完成（幂等；清除退避、保留失败次数） |
+| `POST` | `/sessions/{session_id}/chunks/{index}/complete` | 上报分片完成（幂等；清除退避、保留失败次数；启用验收队列时先转 awaiting_verification） |
 | `POST` | `/sessions/{session_id}/chunks/{index}/reopen` | 完成纠错回退（凭完成时的令牌与摘要，原子重置目标及全部传递下游，`revision` 递增 1） |
 | `POST` | `/sessions/{session_id}/chunks/{index}/fail` | 上报分片失败（校验有效租约，原子清除租约并进入指数退避） |
 | `POST` | `/sessions/{session_id}/finalize` | 提交会话，返回按序分片清单（`sha256-merkle-v1` 会话先校验 Merkle 根，不匹配返回 409 及 `computed_digest`） |
 | `POST` | `/sessions/{session_id}/delivery-tickets` | 为已 finalized 会话签发一次性清单领取凭证（明文 token 仅此一次返回，库内只存 SHA-256/会话/到期/状态） |
 | `POST` | `/delivery-tickets/redeem` | 凭 token + 幂等 `request_id` 兑换按序 manifest（一次性；并发不同 request_id 仅一个成功，同 request_id 重放返回首次结果） |
 | `POST` | `/delivery-tickets/revoke` | 撤销未消费凭证（已消费不可撤销；重复撤销幂等，撤销后不可兑换） |
+| `POST` | `/verifications/lease` | 按完成时间 FIFO 领取一个待验收分片并签发有 TTL 的验收令牌（未过期独占、过期可重领、并发不重复） |
+| `POST` | `/verifications/{session_id}/{chunk_index}/decide` | 凭当前验收令牌 approve（转 completed）或 reject（清除摘要回 pending）；同令牌同决定幂等、冲突决定 409 |
 | `GET` | `/healthz` | 健康检查 |
 
 ## 批量领取与并发上限（curl）
@@ -528,7 +644,7 @@ app/
   db.py        # SQLite 连接与建库建表（启动时自动执行）
   schemas.py   # Pydantic 请求/响应模型
 tests/
-  test_api.py  # 租约独占/过期、幂等、提交、交付凭证等端到端行为测试
+  test_api.py  # 租约独占/过期、幂等、提交、交付凭证、分片验收队列等端到端行为测试
 Dockerfile
 docker-compose.yml
 requirements.txt
