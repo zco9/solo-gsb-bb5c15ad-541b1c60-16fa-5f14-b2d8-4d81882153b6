@@ -88,6 +88,11 @@ class CreateSessionRequest(BaseModel):
         default=300, ge=1, le=86_400,
         description="失败退避冷却上限（秒）：实际冷却取 min(max, base×2^(n-1))；"
                     "必须为正数且不小于 base_retry_seconds")
+    verification_required: bool = Field(
+        default=False,
+        description="是否启用分片验收队列：启用后完成上报先进入 awaiting_verification"
+                    "（而非 completed）且会话不得 finalize；须经验收 approve 才转为 completed，"
+                    "reject 则原子清除摘要并回到 pending。缺省 false 保持原行为")
 
     @model_validator(mode="after")
     def _validate_dependencies(self):
@@ -127,6 +132,8 @@ class SessionResponse(BaseModel):
         default=None, description="会话级并发租约上限；null 表示不限并发")
     base_retry_seconds: int = Field(description="失败退避基数（秒）")
     max_retry_seconds: int = Field(description="失败退避冷却上限（秒）")
+    verification_required: bool = Field(
+        default=False, description="是否启用分片验收；false 时完成上报直接 completed（原行为）")
     created_at: datetime
     finalized_at: Optional[datetime] = None
 
@@ -298,10 +305,76 @@ class CompleteRequest(BaseModel):
 class CompleteResponse(BaseModel):
     session_id: str
     chunk_index: int
-    status: str
+    status: str = Field(
+        description="上报后的分片状态：未启用验收的会话为 completed；"
+                    "启用验收的会话为 awaiting_verification（等待领取验收）")
     chunk_digest: str
     completed_at: datetime
     idempotent_replay: bool = Field(default=False, description="是否为幂等重放")
+
+
+# ---------------------------------------------------------------- 分片验收队列（verification queue）
+
+# 验收决定取值
+VERIFICATION_DECISION_APPROVE = "approve"
+VERIFICATION_DECISION_REJECT = "reject"
+# 决定落库标记
+VERIFICATION_DECIDED_APPROVED = "approved"
+VERIFICATION_DECIDED_REJECTED = "rejected"
+
+# 分片状态
+CHUNK_STATUS_AWAITING_VERIFICATION = "awaiting_verification"
+
+
+class VerificationLeaseRequest(BaseModel):
+    lease_ttl_seconds: Optional[int] = Field(
+        default=None, ge=1,
+        description="验收令牌有效期（秒），缺省取服务端租约默认值，超过服务端上限会被截断")
+
+
+class VerificationGrant(BaseModel):
+    session_id: str = Field(description="被领取分片所属会话 id")
+    chunk_index: int = Field(description="被领取的分片序号")
+    verification_token: str = Field(
+        description="一次性验收令牌：决定时必须原样携带；过期后该分片可被重新领取")
+    chunk_digest: str = Field(description="完成上报时登记的分片摘要，供验收方核对")
+    completed_at: datetime = Field(description="分片完成上报时间（验收队列按此 FIFO）")
+    expires_at: datetime = Field(description="验收令牌到期时间（UTC），过期后可重领")
+
+
+class VerificationLeaseResponse(BaseModel):
+    granted: Optional[VerificationGrant] = Field(
+        default=None,
+        description="本次领取到的待验收分片（按完成时间最早优先）；当前没有可领取分片时为 null")
+
+
+class VerificationDecisionRequest(BaseModel):
+    verification_token: str = Field(
+        min_length=1, max_length=128,
+        description="领取验收时签发的当前令牌；须与该分片当前验收令牌一致")
+    decision: str = Field(
+        description="验收决定：approve（转 completed）或 reject（清除摘要并回到 pending）")
+
+    @model_validator(mode="after")
+    def _validate_decision(self):
+        if self.decision not in (
+            VERIFICATION_DECISION_APPROVE, VERIFICATION_DECISION_REJECT
+        ):
+            raise ValueError("decision must be 'approve' or 'reject'")
+        return self
+
+
+class VerificationDecisionResponse(BaseModel):
+    session_id: str
+    chunk_index: int
+    decision: str = Field(description="本次验收决定：approve | reject")
+    status: str = Field(
+        description="决定后的分片状态：approve => completed；reject => pending")
+    chunk_digest: Optional[str] = Field(
+        default=None,
+        description="分片摘要：approve 后保留完成上报的摘要；reject 后已清除，为 null")
+    idempotent_replay: bool = Field(
+        default=False, description="是否为同一令牌同一决定的幂等重放")
 
 
 class FailRequest(BaseModel):
@@ -362,6 +435,8 @@ class ForkSessionResponse(BaseModel):
         default=None, description="从源会话复制的并发租约上限；null 表示不限并发")
     base_retry_seconds: int = Field(description="从源会话复制的失败退避基数（秒）")
     max_retry_seconds: int = Field(description="从源会话复制的失败退避冷却上限（秒）")
+    verification_required: bool = Field(
+        default=False, description="从源会话复制的分片验收开关")
     created_at: datetime
     idempotent_replay: bool = Field(
         default=False, description="是否为同一 request_id 的幂等重放（重放返回首次创建的会话）")
@@ -448,7 +523,7 @@ class RevokeDeliveryTicketResponse(BaseModel):
 
 class ChunkStatus(BaseModel):
     chunk_index: int
-    status: str  # pending | leased | completed（过期租约/冷却中的分片按 pending 展示）
+    status: str  # pending | leased | completed | awaiting_verification（过期验收令牌按 awaiting_verification 展示）
     lease_expires_at: Optional[datetime] = None
     chunk_digest: Optional[str] = None
     completed_at: Optional[datetime] = None
@@ -458,6 +533,10 @@ class ChunkStatus(BaseModel):
     retry_after: Optional[datetime] = Field(
         default=None,
         description="退避冷却结束时间；仅当该分片正处于冷却中时非 null，冷却结束或完成上报后为 null")
+    verification_expires_at: Optional[datetime] = Field(
+        default=None,
+        description="当前验收令牌到期时间；仅 awaiting_verification 且被领取且令牌未过期时非 null；"
+                    "未启用验收、未被领取验收或令牌已过期时为 null（过期分片可被重新领取）")
 
 
 class BlockedChunk(BaseModel):
@@ -475,12 +554,16 @@ class ReadyResponse(BaseModel):
     session_id: str
     ready_chunks: list[int] = Field(
         description="当前可领取的分片：未完成、无有效租约（过期租约视为可领取）、"
-                    "不在失败退避冷却中且前置已全部完成")
+                    "不在失败退避冷却中且前置已全部完成。待验收分片不进入此列表")
     blocked_chunks: list[BlockedChunk] = Field(
         description="被依赖阻塞的分片及各自未完成的前置项")
     cooling_chunks: list[CoolingChunk] = Field(
         default_factory=list,
         description="因失败退避而暂时不可领取的分片（按序号升序）；冷却结束后自动恢复可领取")
+    awaiting_verification_chunks: list[int] = Field(
+        default_factory=list,
+        description="已完成上报、等待验收决定的分片（按序号升序）；"
+                    "仅 verification_required 会话会出现，不属于 ready/blocked/cooling 任一分桶")
 
 
 class SessionStatusResponse(BaseModel):
@@ -499,8 +582,14 @@ class SessionStatusResponse(BaseModel):
         default=None, description="会话级并发租约上限；null 表示不限并发")
     base_retry_seconds: int = Field(default=5, description="失败退避基数（秒）")
     max_retry_seconds: int = Field(default=300, description="失败退避冷却上限（秒）")
+    verification_required: bool = Field(
+        default=False,
+        description="是否启用分片验收；启用时完成上报先进入 awaiting_verification，approve 后才完成")
     active_leases: int = Field(
         default=0, description="当前有效（未过期）租约数，过期租约不计入")
+    awaiting_verification_chunks: list[int] = Field(
+        default_factory=list,
+        description="当前处于 awaiting_verification 的分片序号（按序号升序）；未启用验收时恒为空")
     created_at: datetime
     finalized_at: Optional[datetime] = None
     chunks: list[ChunkStatus]

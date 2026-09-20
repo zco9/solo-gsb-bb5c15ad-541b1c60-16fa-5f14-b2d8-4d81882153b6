@@ -2566,3 +2566,572 @@ def test_migration_adds_delivery_ticket_tables_to_legacy_database(tmp_path):
 
     db.run_migrations(migrated)  # 再次执行幂等不报错
     migrated.close()
+
+
+# ---------------------------------------------------------------- 分片验收队列（verification queue）
+
+def make_verification_session(total_chunks=3, file_digest="e" * 64, dependencies=None):
+    payload = {
+        "total_chunks": total_chunks,
+        "file_digest": file_digest,
+        "digest_algorithm": "sha256",
+        "verification_required": True,
+    }
+    if dependencies is not None:
+        payload["dependencies"] = dependencies
+    resp = client.post("/sessions", json=payload)
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+def vlease(ttl=None):
+    body = {} if ttl is None else {"lease_ttl_seconds": ttl}
+    return client.post("/verifications/lease", json=body)
+
+
+def drain_verification_queue(decision="approve"):
+    """验收队列跨会话共享且测试共用同一数据库：清空队列（过期令牌先统一过期再重领），
+    使后续测试可以假设从空队列开始。"""
+    get_conn().execute(
+        "UPDATE chunks SET verification_expires_at = '2000-01-01T00:00:00+00:00'"
+        " WHERE status = 'awaiting_verification'")
+    get_conn().commit()
+    while True:
+        g = vlease().json()["granted"]
+        if g is None:
+            return
+        vdecide(g["session_id"], g["chunk_index"], g["verification_token"], decision)
+
+
+def vdecide(session_id, index, token, decision):
+    return client.post(
+        f"/verifications/{session_id}/{index}/decide",
+        json={"verification_token": token, "decision": decision},
+    )
+
+
+def expire_verification(session_id, index, when="2000-01-01T00:00:00+00:00"):
+    get_conn().execute(
+        "UPDATE chunks SET verification_expires_at = ?"
+        " WHERE session_id = ? AND chunk_index = ?",
+        (when, session_id, index),
+    )
+    get_conn().commit()
+
+
+def upload_and_report(session_id, index, digest):
+    """领取上传租约并上报完成，返回 complete 响应。"""
+    token = lease(session_id, index).json()["lease_token"]
+    return complete(session_id, index, token, digest)
+
+
+def test_verification_flag_defaults_off_and_persisted():
+    plain = make_session(total_chunks=2)
+    assert plain["verification_required"] is False
+    assert client.get(f"/sessions/{plain['id']}").json()["verification_required"] is False
+
+    vs = make_verification_session(total_chunks=2)
+    assert vs["verification_required"] is True
+    assert client.get(f"/sessions/{vs['id']}").json()["verification_required"] is True
+
+
+def test_non_verification_session_keeps_original_behavior():
+    drain_verification_queue()
+    s = make_session(total_chunks=2)
+    token = lease(s["id"], 0).json()["lease_token"]
+    r = complete(s["id"], 0, token, "a" * 64)
+    assert r.status_code == 200
+    assert r.json()["status"] == "completed"
+    # 未启用验收：验收队列始终为空
+    assert vlease().json()["granted"] is None
+    # 分片状态仍是 completed，无验收字段
+    st = client.get(f"/sessions/{s['id']}").json()
+    assert st["chunks"][0]["status"] == "completed"
+    assert st["chunks"][0]["verification_expires_at"] is None
+    assert st["awaiting_verification_chunks"] == []
+    # 未启用验收会话上作决定 -> 409
+    assert vdecide(s["id"], 0, "any-token", "approve").status_code == 409
+
+
+def test_complete_enters_awaiting_verification_and_blocks_finalize():
+    s = make_verification_session(total_chunks=2)
+    r = upload_and_report(s["id"], 0, "a" * 64)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "awaiting_verification"
+    assert body["idempotent_replay"] is False
+
+    st = client.get(f"/sessions/{s['id']}").json()
+    assert st["chunks"][0]["status"] == "awaiting_verification"
+    assert st["chunks"][0]["chunk_digest"] == "a" * 64
+    assert st["awaiting_verification_chunks"] == [0]
+    assert st["completed_chunks"] == 0
+    assert st["missing_chunks"] == [0, 1]
+
+    # 待验收分片不可领取上传租约 / 失败上报 / reopen
+    assert lease(s["id"], 0).status_code == 409
+    assert client.post(
+        f"/sessions/{s['id']}/chunks/0/fail", json={"lease_token": "x"}).status_code == 409
+    assert client.post(
+        f"/sessions/{s['id']}/chunks/0/reopen",
+        json={"lease_token": "x", "expected_digest": "a" * 64}).status_code == 409
+
+    # finalize 被拒绝，并标出待验收分片
+    fr = client.post(f"/sessions/{s['id']}/finalize")
+    assert fr.status_code == 409
+    assert fr.json()["missing_chunks"] == [0, 1]
+    assert fr.json()["awaiting_verification_chunks"] == [0]
+
+
+def test_awaiting_verification_chunk_is_not_claimable_or_ready():
+    s = make_verification_session(total_chunks=2)
+    upload_and_report(s["id"], 0, "a" * 64)
+
+    ready = client.get(f"/sessions/{s['id']}/ready").json()
+    assert ready["ready_chunks"] == [1]
+    assert ready["awaiting_verification_chunks"] == [0]
+    assert ready["blocked_chunks"] == []
+    assert ready["cooling_chunks"] == []
+
+    # 批量领取不会发放待验收分片
+    batch = client.post(
+        f"/sessions/{s['id']}/leases/batch", json={"count": 10}).json()
+    assert [g["chunk_index"] for g in batch["granted"]] == [1]
+    assert batch["blocked"] == 0
+
+
+def test_complete_is_idempotent_while_awaiting():
+    s = make_verification_session(total_chunks=1)
+    token = lease(s["id"], 0).json()["lease_token"]
+    r1 = complete(s["id"], 0, token, "a" * 64)
+    assert r1.json()["status"] == "awaiting_verification"
+    first_completed_at = r1.json()["completed_at"]
+
+    r2 = complete(s["id"], 0, token, "a" * 64)
+    assert r2.status_code == 200
+    assert r2.json()["idempotent_replay"] is True
+    assert r2.json()["status"] == "awaiting_verification"
+    assert r2.json()["completed_at"] == first_completed_at
+
+    # 不同摘要仍冲突
+    assert complete(s["id"], 0, token, "b" * 64).status_code == 409
+
+
+def test_verification_lease_fifo_and_no_duplicate():
+    drain_verification_queue()
+    a = make_verification_session(total_chunks=2)
+    b = make_verification_session(total_chunks=1)
+
+    upload_and_report(a["id"], 0, "0" * 64)
+    upload_and_report(b["id"], 0, "0" * 64)
+    upload_and_report(a["id"], 1, "1" * 64)
+
+    g1 = vlease().json()["granted"]
+    g2 = vlease().json()["granted"]
+    g3 = vlease().json()["granted"]
+    assert (g1["session_id"], g1["chunk_index"]) == (a["id"], 0)
+    assert (g2["session_id"], g2["chunk_index"]) == (b["id"], 0)
+    assert (g3["session_id"], g3["chunk_index"]) == (a["id"], 1)
+    for g in (g1, g2, g3):
+        assert g["verification_token"]
+        assert g["expires_at"]
+        assert g["chunk_digest"]
+        assert g["completed_at"]
+
+    # 队列已空
+    assert vlease().json()["granted"] is None
+    # 三个令牌互不相同
+    assert len({g1["verification_token"], g2["verification_token"],
+                g3["verification_token"]}) == 3
+
+
+def test_verification_lease_excludes_non_verification_sessions():
+    drain_verification_queue()
+    s = make_session(total_chunks=1)
+    token = lease(s["id"], 0).json()["lease_token"]
+    complete(s["id"], 0, token, "a" * 64)
+    assert vlease().json()["granted"] is None
+
+
+def test_verification_lease_token_ttl_expires_and_released():
+    drain_verification_queue()
+    s = make_verification_session(total_chunks=1)
+    upload_and_report(s["id"], 0, "a" * 64)
+
+    g1 = vlease(ttl=300).json()["granted"]
+    assert g1 is not None
+    # 未过期前不会重复领取
+    assert vlease().json()["granted"] is None
+
+    st = client.get(f"/sessions/{s['id']}").json()
+    assert st["chunks"][0]["verification_expires_at"] is not None
+
+    # 过期后可被重新领取，令牌轮换
+    expire_verification(s["id"], 0)
+    g2 = vlease().json()["granted"]
+    assert g2 is not None
+    assert g2["verification_token"] != g1["verification_token"]
+
+    st2 = client.get(f"/sessions/{s['id']}").json()
+    # 旧令牌已过期（读时不展示），新令牌未过期
+    assert st2["chunks"][0]["verification_expires_at"] is not None
+
+
+def test_verification_lease_never_double_grants_under_concurrency():
+    # 5 个待验收分片，12 个并发请求抢
+    drain_verification_queue()
+    sessions = [make_verification_session(total_chunks=1) for _ in range(5)]
+    for s in sessions:
+        upload_and_report(s["id"], 0, "a" * 64)
+
+    granted: list[tuple[str, int]] = []
+    granted_lock = threading.Lock()
+    barrier = threading.Barrier(12)
+
+    def worker():
+        barrier.wait()
+        body = vlease().json()
+        if body["granted"] is not None:
+            with granted_lock:
+                granted.append((body["granted"]["session_id"],
+                                body["granted"]["chunk_index"]))
+
+    threads = [threading.Thread(target=worker) for _ in range(12)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(granted) == 5
+    assert len(set(granted)) == 5
+    assert vlease().json()["granted"] is None
+
+
+def test_decide_approve_completes_and_allows_finalize():
+    drain_verification_queue()
+    s = make_verification_session(total_chunks=2)
+    upload_and_report(s["id"], 0, "a" * 64)
+    upload_and_report(s["id"], 1, "b" * 64)
+
+    g0 = vlease().json()["granted"]
+    g1 = vlease().json()["granted"]
+
+    r0 = vdecide(s["id"], g0["chunk_index"], g0["verification_token"], "approve")
+    assert r0.status_code == 200
+    body = r0.json()
+    assert body["status"] == "completed"
+    assert body["decision"] == "approve"
+    assert body["idempotent_replay"] is False
+    assert body["chunk_digest"] == "a" * 64
+
+    # approve 后分片不再在待验收队列
+    st = client.get(f"/sessions/{s['id']}").json()
+    assert st["awaiting_verification_chunks"] == [1]
+    assert st["chunks"][0]["status"] == "completed"
+    assert st["chunks"][0]["verification_expires_at"] is None
+    # 分片 1 的验收令牌此前已由 g1 持有：队列中没有无令牌的待验收分片
+    assert vlease().json()["granted"] is None
+    vdecide(s["id"], 1, g1["verification_token"], "approve")
+
+    # 全部 approve 后可以 finalize，清单保留摘要与完成时间
+    fr = client.post(f"/sessions/{s['id']}/finalize")
+    assert fr.status_code == 200, fr.text
+    assert [m["chunk_digest"] for m in fr.json()["manifest"]] == ["a" * 64, "b" * 64]
+
+
+def test_decide_reject_clears_digest_and_back_to_pending():
+    drain_verification_queue()
+    s = make_verification_session(total_chunks=1)
+    upload_and_report(s["id"], 0, "a" * 64)
+    g = vlease().json()["granted"]
+
+    r = vdecide(s["id"], 0, g["verification_token"], "reject")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "pending"
+    assert body["decision"] == "reject"
+    assert body["chunk_digest"] is None
+    assert body["idempotent_replay"] is False
+
+    st = client.get(f"/sessions/{s['id']}").json()
+    ch = st["chunks"][0]
+    assert ch["status"] == "pending"
+    assert ch["chunk_digest"] is None
+    assert ch["completed_at"] is None
+    assert st["awaiting_verification_chunks"] == []
+    # 可重新领取上传租约，重新完成并最终 approve
+    token = lease(s["id"], 0).json()["lease_token"]
+    complete(s["id"], 0, token, "c" * 64)
+    g2 = vlease().json()["granted"]
+    assert g2["chunk_digest"] == "c" * 64
+    assert vdecide(s["id"], 0, g2["verification_token"], "approve").status_code == 200
+    assert client.post(f"/sessions/{s['id']}/finalize").status_code == 200
+
+
+def test_decide_reject_is_atomic_and_preserves_failure_count():
+    drain_verification_queue()
+    s = make_verification_session(total_chunks=1)
+    # 先制造一次失败计数：领取 -> fail -> 冷却结束后再领取完成
+    t0 = lease(s["id"], 0).json()["lease_token"]
+    client.post(f"/sessions/{s['id']}/chunks/0/fail", json={"lease_token": t0})
+    get_conn().execute(
+        "UPDATE chunks SET backoff_until = '2000-01-01T00:00:00+00:00'"
+        " WHERE session_id = ? AND chunk_index = 0", (s["id"],))
+    get_conn().commit()
+    t1 = lease(s["id"], 0).json()["lease_token"]
+    complete(s["id"], 0, t1, "a" * 64)
+    g = vlease().json()["granted"]
+    vdecide(s["id"], 0, g["verification_token"], "reject")
+
+    row = get_conn().execute(
+        "SELECT * FROM chunks WHERE session_id = ? AND chunk_index = 0",
+        (s["id"],)).fetchone()
+    assert row["status"] == "pending"
+    assert row["chunk_digest"] is None
+    assert row["completed_at"] is None
+    assert row["lease_token"] is None
+    assert row["lease_expires_at"] is None
+    assert row["verification_token"] is None
+    assert row["backoff_until"] is None
+    assert row["failure_count"] == 1  # 累计失败次数保留
+
+
+def test_decide_same_token_same_decision_is_idempotent():
+    drain_verification_queue()
+    s = make_verification_session(total_chunks=1)
+    upload_and_report(s["id"], 0, "a" * 64)
+    g = vlease().json()["granted"]
+
+    r1 = vdecide(s["id"], 0, g["verification_token"], "approve")
+    r2 = vdecide(s["id"], 0, g["verification_token"], "approve")
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert r1.json()["idempotent_replay"] is False
+    assert r2.json()["idempotent_replay"] is True
+    assert r2.json()["status"] == "completed"
+    assert r2.json()["chunk_digest"] == "a" * 64
+
+    # approve 重放即使在令牌 TTL 过期、会话 finalize 后仍幂等
+    expire_verification(s["id"], 0)
+    client.post(f"/sessions/{s['id']}/finalize")
+    r3 = vdecide(s["id"], 0, g["verification_token"], "approve")
+    assert r3.status_code == 200
+    assert r3.json()["idempotent_replay"] is True
+
+
+def test_decide_reject_replay_is_idempotent_before_reupload():
+    drain_verification_queue()
+    s = make_verification_session(total_chunks=1)
+    upload_and_report(s["id"], 0, "a" * 64)
+    g = vlease().json()["granted"]
+
+    r1 = vdecide(s["id"], 0, g["verification_token"], "reject")
+    # reject 后尚未重新上传：分片已回 pending，旧令牌重放 -> 409（状态不再是待验收）
+    r2 = vdecide(s["id"], 0, g["verification_token"], "reject")
+    assert r1.status_code == 200
+    assert r2.status_code == 409
+
+
+def test_conflicting_decisions_return_409():
+    drain_verification_queue()
+    s = make_verification_session(total_chunks=1)
+    upload_and_report(s["id"], 0, "a" * 64)
+    g = vlease().json()["granted"]
+
+    # 持同一有效令牌先 reject 再 approve -> 冲突 409（reject 已原子落地）
+    assert vdecide(s["id"], 0, g["verification_token"], "reject").status_code == 200
+    # reject 已清除令牌：冲突决定得到的是“非待验收/令牌不匹配”409，而非落地状态翻转
+    assert vdecide(s["id"], 0, g["verification_token"], "approve").status_code == 409
+    assert client.get(f"/sessions/{s['id']}").json()["chunks"][0]["status"] == "pending"
+
+    # 新一轮：approve 后再持同一令牌 reject -> 冲突决定 409，状态保持 completed
+    token = lease(s["id"], 0).json()["lease_token"]
+    complete(s["id"], 0, token, "a" * 64)
+    g2 = vlease().json()["granted"]
+    assert vdecide(s["id"], 0, g2["verification_token"], "approve").status_code == 200
+    conflict_resp = vdecide(s["id"], 0, g2["verification_token"], "reject")
+    assert conflict_resp.status_code == 409
+    assert conflict_resp.json()["detail"] == "verification decision conflict"
+    assert client.get(f"/sessions/{s['id']}").json()["chunks"][0]["status"] == "completed"
+
+
+def test_decide_rejects_wrong_and_expired_token():
+    drain_verification_queue()
+    s = make_verification_session(total_chunks=1)
+    upload_and_report(s["id"], 0, "a" * 64)
+    g = vlease().json()["granted"]
+
+    assert vdecide(s["id"], 0, "wrong-token", "approve").status_code == 409
+
+    # 令牌过期：决定被拒绝；重新领取后新令牌有效
+    expire_verification(s["id"], 0)
+    assert vdecide(s["id"], 0, g["verification_token"], "approve").status_code == 409
+    g2 = vlease().json()["granted"]
+    assert g2["verification_token"] != g["verification_token"]
+    # 旧令牌在新令牌发放后依然无效
+    assert vdecide(s["id"], 0, g["verification_token"], "approve").status_code == 409
+    assert vdecide(s["id"], 0, g2["verification_token"], "approve").status_code == 200
+
+
+def test_decide_unknown_session_and_chunk():
+    s = make_verification_session(total_chunks=1)
+    assert vdecide("no-such-session", 0, "t", "approve").status_code == 404
+    assert vdecide(s["id"], 99, "t", "approve").status_code == 404
+
+
+def test_decide_request_validation():
+    drain_verification_queue()
+    # decision 只能是 approve/reject
+    s = make_verification_session(total_chunks=1)
+    upload_and_report(s["id"], 0, "a" * 64)
+    g = vlease().json()["granted"]
+    assert client.post(
+        f"/verifications/{s['id']}/0/decide",
+        json={"verification_token": g["verification_token"], "decision": "maybe"},
+    ).status_code == 422
+    assert client.post(
+        f"/verifications/{s['id']}/0/decide",
+        json={"verification_token": g["verification_token"]},
+    ).status_code == 422
+    assert client.post(
+        f"/verifications/{s['id']}/0/decide",
+        json={"decision": "approve"},
+    ).status_code == 422
+    # lease ttl 必须为正
+    assert vlease(ttl=0).status_code == 422
+
+
+def test_verification_with_dependencies_blocks_until_prerequisites_verified():
+    # 分片 1 依赖分片 0：0 处于 awaiting 时，1 仍不可领取
+    s = make_verification_session(total_chunks=2, dependencies={"1": [0]})
+    upload_and_report(s["id"], 0, "a" * 64)
+    ready = client.get(f"/sessions/{s['id']}/ready").json()
+    assert ready["ready_chunks"] == []
+    assert ready["awaiting_verification_chunks"] == [0]
+    assert [b["chunk_index"] for b in ready["blocked_chunks"]] == [1]
+
+    # 验收通过 0 后，1 自动可领取
+    g = vlease().json()["granted"]
+    vdecide(s["id"], 0, g["verification_token"], "approve")
+    ready2 = client.get(f"/sessions/{s['id']}/ready").json()
+    assert ready2["ready_chunks"] == [1]
+
+
+def test_fork_copies_verification_required_flag():
+    drain_verification_queue()
+    src = make_verification_session(total_chunks=2)
+    t0 = lease(src["id"], 0).json()["lease_token"]
+    complete(src["id"], 0, t0, "a" * 64)
+    g = vlease().json()["granted"]
+    vdecide(src["id"], 0, g["verification_token"], "approve")
+
+    fr = client.post(
+        f"/sessions/{src['id']}/fork",
+        json={"expected_revision": 0, "request_id": "vfork-1",
+              "reuse_chunks": [0]})
+    assert fr.status_code == 201, fr.text
+    assert fr.json()["verification_required"] is True
+    new_id = fr.json()["id"]
+    # 复用分片直接为 completed（无需再验收），新分片完成后仍进入待验收
+    st = client.get(f"/sessions/{new_id}").json()
+    assert st["chunks"][0]["status"] == "completed"
+    upload_and_report(new_id, 1, "b" * 64)
+    assert client.get(f"/sessions/{new_id}").json()["awaiting_verification_chunks"] == [1]
+    granted = vlease().json()["granted"]
+    assert granted["session_id"] == new_id
+
+
+def test_verification_ttl_is_applied_and_capped():
+    drain_verification_queue()
+    s = make_verification_session(total_chunks=2)
+    upload_and_report(s["id"], 0, "a" * 64)
+    upload_and_report(s["id"], 1, "b" * 64)
+    g1 = vlease(ttl=60).json()["granted"]
+    from datetime import datetime as _dt
+    expires = _dt.fromisoformat(g1["expires_at"])
+    issued = _dt.fromisoformat(g1["completed_at"])
+    assert 0 < (expires - issued).total_seconds() <= 61
+
+    expire_verification(s["id"], 0)
+    g2 = vlease(ttl=10 ** 9).json()["granted"]
+    expires2 = _dt.fromisoformat(g2["expires_at"])
+    now = datetime.now(timezone.utc)
+    assert (expires2 - now).total_seconds() <= 3600 + 5
+
+
+def test_migration_adds_verification_columns_to_legacy_database(tmp_path):
+    import sqlite3
+
+    legacy = tmp_path / "legacy7.db"
+    conn = sqlite3.connect(legacy)
+    # 验收特性之前的旧 SCHEMA：sessions 无 verification_required，chunks 无验收三列
+    conn.executescript(
+        """
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, total_chunks INTEGER NOT NULL,
+            file_digest TEXT NOT NULL, digest_algorithm TEXT NOT NULL DEFAULT 'sha256',
+            status TEXT NOT NULL DEFAULT 'active', max_active_leases INTEGER,
+            base_retry_seconds INTEGER NOT NULL DEFAULT 5,
+            max_retry_seconds INTEGER NOT NULL DEFAULT 300,
+            revision INTEGER NOT NULL DEFAULT 0,
+            source_session_id TEXT,
+            created_at TEXT NOT NULL, finalized_at TEXT
+        );
+        CREATE TABLE chunks (
+            session_id TEXT NOT NULL, chunk_index INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending', lease_token TEXT,
+            lease_expires_at TEXT, chunk_digest TEXT, completed_at TEXT,
+            failure_count INTEGER NOT NULL DEFAULT 0, backoff_until TEXT,
+            PRIMARY KEY (session_id, chunk_index)
+        );
+        INSERT INTO sessions (id, total_chunks, file_digest, created_at)
+            VALUES ('old', 1, 'dig', '2026-01-01T00:00:00+00:00');
+        INSERT INTO chunks (session_id, chunk_index, status) VALUES ('old', 0, 'pending');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    import app.db as db
+
+    migrated = sqlite3.connect(legacy)
+    db.run_migrations(migrated)
+
+    scolumns = {r[1] for r in migrated.execute(
+        "PRAGMA table_info(sessions)").fetchall()}
+    assert "verification_required" in scolumns
+    ccolumns = {r[1] for r in migrated.execute(
+        "PRAGMA table_info(chunks)").fetchall()}
+    assert {"verification_token", "verification_expires_at",
+            "verification_decided"} <= ccolumns
+    indexes = {r[0] for r in migrated.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index'").fetchall()}
+    assert "idx_chunks_verification_queue" in indexes
+
+    # 既有会话默认关闭验收，验收队列查询不会选中它的分片
+    assert migrated.execute(
+        "SELECT verification_required FROM sessions WHERE id = 'old'").fetchone()[0] == 0
+    n = migrated.execute(
+        "SELECT COUNT(*) FROM chunks c JOIN sessions s ON s.id = c.session_id"
+        " WHERE c.status = 'awaiting_verification' AND s.verification_required = 1"
+    ).fetchone()[0]
+    assert n == 0
+
+    # 启用验收后可正常走领取/决定的字段读写
+    migrated.execute(
+        "UPDATE sessions SET verification_required = 1 WHERE id = 'old'")
+    migrated.execute(
+        "UPDATE chunks SET status = 'awaiting_verification', chunk_digest = 'aa',"
+        " completed_at = '2026-01-02T00:00:00+00:00' WHERE session_id = 'old'"
+        " AND chunk_index = 0")
+    migrated.execute(
+        "UPDATE chunks SET verification_token = 'tok',"
+        " verification_expires_at = '2999-01-01T00:00:00+00:00',"
+        " verification_decided = NULL WHERE session_id = 'old' AND chunk_index = 0")
+    migrated.commit()
+    row = migrated.execute(
+        "SELECT verification_token, verification_decided FROM chunks"
+        " WHERE session_id = 'old' AND chunk_index = 0").fetchone()
+    assert row[0] == "tok" and row[1] is None
+
+    db.run_migrations(migrated)  # 再次执行幂等不报错
+    migrated.close()

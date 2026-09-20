@@ -15,18 +15,19 @@ _conn: sqlite3.Connection | None = None
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
-    id                  TEXT PRIMARY KEY,
-    total_chunks        INTEGER NOT NULL,
-    file_digest         TEXT NOT NULL,
-    digest_algorithm    TEXT NOT NULL DEFAULT 'sha256',
-    status              TEXT NOT NULL DEFAULT 'active',   -- active | finalized
-    max_active_leases   INTEGER,                          -- 会话级并发租约上限；NULL 表示不限
-    base_retry_seconds  INTEGER NOT NULL DEFAULT 5,       -- 失败退避基数（第 1 次失败冷却秒数）
-    max_retry_seconds   INTEGER NOT NULL DEFAULT 300,     -- 失败退避冷却上限（秒）
-    revision            INTEGER NOT NULL DEFAULT 0,       -- 修订号：每次成功 reopen 回退递增 1
-    source_session_id   TEXT,                             -- fork 来源会话；NULL 表示原生会话
-    created_at          TEXT NOT NULL,
-    finalized_at        TEXT
+    id                     TEXT PRIMARY KEY,
+    total_chunks           INTEGER NOT NULL,
+    file_digest            TEXT NOT NULL,
+    digest_algorithm       TEXT NOT NULL DEFAULT 'sha256',
+    status                 TEXT NOT NULL DEFAULT 'active',   -- active | finalized
+    max_active_leases      INTEGER,                          -- 会话级并发租约上限；NULL 表示不限
+    base_retry_seconds     INTEGER NOT NULL DEFAULT 5,       -- 失败退避基数（第 1 次失败冷却秒数）
+    max_retry_seconds      INTEGER NOT NULL DEFAULT 300,     -- 失败退避冷却上限（秒）
+    revision               INTEGER NOT NULL DEFAULT 0,       -- 修订号：每次成功 reopen 回退递增 1
+    source_session_id      TEXT,                             -- fork 来源会话；NULL 表示原生会话
+    verification_required  INTEGER NOT NULL DEFAULT 0,       -- 是否启用分片验收：0 关闭（原行为）| 1 启用
+    created_at             TEXT NOT NULL,
+    finalized_at           TEXT
 );
 
 -- 进度分支幂等记录：(源会话, request_id) 唯一，重放返回首次创建的新会话
@@ -49,19 +50,26 @@ CREATE TABLE IF NOT EXISTS dispatch_cursors (
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
-    session_id        TEXT NOT NULL REFERENCES sessions(id),
-    chunk_index       INTEGER NOT NULL,
-    status            TEXT NOT NULL DEFAULT 'pending',  -- pending | leased | completed
-    lease_token       TEXT,
-    lease_expires_at  TEXT,
-    chunk_digest      TEXT,
-    completed_at      TEXT,
-    failure_count     INTEGER NOT NULL DEFAULT 0,       -- 累计失败次数（完成上报不清零）
-    backoff_until     TEXT,                             -- 退避冷却结束时间；NULL 表示未在冷却
+    session_id                TEXT NOT NULL REFERENCES sessions(id),
+    chunk_index               INTEGER NOT NULL,
+    status                    TEXT NOT NULL DEFAULT 'pending',  -- pending | leased | completed | awaiting_verification
+    lease_token               TEXT,
+    lease_expires_at          TEXT,
+    chunk_digest              TEXT,
+    completed_at              TEXT,
+    failure_count             INTEGER NOT NULL DEFAULT 0,       -- 累计失败次数（完成上报不清零）
+    backoff_until             TEXT,                             -- 退避冷却结束时间；NULL 表示未在冷却
+    verification_token        TEXT,                             -- 当前验收令牌；NULL 表示未被领取验收
+    verification_expires_at   TEXT,                             -- 验收令牌到期时间；过期可重领
+    verification_decided      TEXT,                             -- 当前令牌已给出的决定：approved | rejected；NULL 表示未决定
     PRIMARY KEY (session_id, chunk_index)
 );
 
 CREATE INDEX IF NOT EXISTS idx_chunks_session ON chunks(session_id);
+
+-- 验收队列领取索引：仅待验收分片进入，按完成时间 FIFO，同刻按（会话, 分片）稳定排序
+CREATE INDEX IF NOT EXISTS idx_chunks_verification_queue ON chunks(completed_at, session_id, chunk_index)
+    WHERE status = 'awaiting_verification';
 
 -- 分片依赖图：chunk_index 领取租约前，depends_on 必须已完成
 CREATE TABLE IF NOT EXISTS chunk_dependencies (
@@ -101,6 +109,7 @@ CREATE TABLE IF NOT EXISTS delivery_ticket_redemptions (
 # 不会为已存在的表补列，故需显式 ALTER）。条目为 (kind, target, ddl)：
 # - ("column", "sessions.col", ALTER ...)：列不存在时补列
 # - ("table", "table_name", CREATE TABLE ...)：表不存在时建表（新表无法用 ALTER 补齐）
+# - ("index", "index_name", CREATE INDEX ...)：索引不存在时创建（DDL 自带 IF NOT EXISTS）
 MIGRATIONS = [
     # 0001: 会话级并发租约上限；旧库已存在的会话取 NULL，即保持“不限并发”的旧行为
     (
@@ -197,7 +206,46 @@ CREATE TABLE delivery_ticket_redemptions (
 )
         """,
     ),
+    # 0010: 会话是否启用分片验收；旧库既有会话取 0（关闭），完全保持原行为
+    (
+        "column",
+        "sessions.verification_required",
+        "ALTER TABLE sessions ADD COLUMN verification_required INTEGER NOT NULL DEFAULT 0",
+    ),
+    # 0011: 分片验收令牌与决定；既有分片验收列为 NULL，不进入验收队列
+    (
+        "column",
+        "chunks.verification_token",
+        "ALTER TABLE chunks ADD COLUMN verification_token TEXT",
+    ),
+    (
+        "column",
+        "chunks.verification_expires_at",
+        "ALTER TABLE chunks ADD COLUMN verification_expires_at TEXT",
+    ),
+    (
+        "column",
+        "chunks.verification_decided",
+        "ALTER TABLE chunks ADD COLUMN verification_decided TEXT",
+    ),
+    # 0012: 验收队列领取索引（部分索引）；旧库直接新建，仅待验收分片进入
+    (
+        "index",
+        "idx_chunks_verification_queue",
+        "CREATE INDEX IF NOT EXISTS idx_chunks_verification_queue"
+        " ON chunks(completed_at, session_id, chunk_index)"
+        " WHERE status = 'awaiting_verification'",
+    ),
 ]
+
+
+def _existing_indexes(conn: sqlite3.Connection) -> set[str]:
+    return {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index'"
+        ).fetchall()
+    }
 
 
 def _existing_tables(conn: sqlite3.Connection) -> set[str]:
@@ -218,9 +266,14 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
 def run_migrations(conn: sqlite3.Connection) -> None:
     with DB_LOCK:
         tables = _existing_tables(conn)
+        indexes = _existing_indexes(conn)
         for kind, target, ddl in MIGRATIONS:
             if kind == "table":
                 if target not in tables:
+                    conn.execute(ddl)
+                continue
+            if kind == "index":
+                if target not in indexes:
                     conn.execute(ddl)
                 continue
             table, _, column_name = target.partition(".")
